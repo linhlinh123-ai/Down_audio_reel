@@ -1,0 +1,5 @@
+flask
+yt-dlp>=2024.09.15
+google-cloud-storage
+gunicorn
+requests
