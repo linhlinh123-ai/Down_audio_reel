@@ -2,111 +2,90 @@ from flask import Flask, request, jsonify
 import yt_dlp
 import os
 from google.cloud import storage
-import threading
 import uuid
-import glob
 import logging
 
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 
-# Tên Bucket GCS lấy từ biến môi trường
+# Tên Bucket GCS
 BUCKET_NAME = os.environ.get("GCS_BUCKET", "")
 
 def upload_to_gcs(local_path, bucket_name, dest_blob):
-    """Upload file lên GCS và trả về link"""
+    """Upload file lên GCS và trả về link public"""
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(dest_blob)
     blob.upload_from_filename(local_path)
     return f"https://storage.googleapis.com/{bucket_name}/{dest_blob}"
 
-def process_audio_job(job_id, url, callback_url):
-    """Tải audio và upload"""
-    # Cấu hình chỉ tải Audio và convert sang MP3
+@app.route("/")
+def home():
+    return "Audio Downloader (Sync Mode) is Ready!"
+
+@app.route("/download-audio", methods=["POST"])
+def download_audio():
+    # 1. Nhận dữ liệu
+    data = request.get_json(silent=True)
+    if not data or "url" not in data:
+        return jsonify({"status": "error", "message": "Thiếu tham số 'url'"}), 400
+
+    url = data["url"]
+    job_id = str(uuid.uuid4())
+    
+    # Cấu hình yt-dlp
     ydl_opts = {
-        'format': 'bestaudio/best',  # Chỉ tìm audio tốt nhất
-        'outtmpl': '/tmp/%(id)s.%(ext)s',
-        'cookiefile': '/app/cookies.txt', # Vẫn cần cho FB nếu video không public
+        'format': 'bestaudio/best',
+        'outtmpl': f'/tmp/{job_id}.%(ext)s',
+        'cookiefile': '/app/cookies.txt', # Giữ nguyên nếu bạn có dùng cookies
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',      # Ép chuyển sang MP3 cho thông dụng
+            'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
         'quiet': True,
         'no_warnings': True,
     }
 
-    result = None
-    final_filename = None
+    final_filename = f"/tmp/{job_id}.mp3"
 
     try:
-        app.logger.info(f"Job {job_id}: Bắt đầu tải audio {url}")
+        app.logger.info(f"Đang xử lý: {url}")
         
+        # 2. Tải và Convert (Code sẽ dừng ở đây đợi xong mới chạy tiếp)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            video_id = info.get("id")
-            
-            # Lưu ý: Vì dùng postprocessor convert sang mp3, 
-            # tên file thực tế sẽ có đuôi .mp3 thay vì đuôi gốc (như .m4a, .webm)
-            # Ta cần đoán đúng tên file kết quả:
-            original_ext = info.get("ext")
-            temp_path = ydl.prepare_filename(info)
-            final_filename = temp_path.rsplit('.', 1)[0] + ".mp3"
+            title = info.get("title", "audio")
 
+        # 3. Upload lên GCS
         if os.path.exists(final_filename):
             file_size = os.path.getsize(final_filename)
-            app.logger.info(f"Job {job_id}: Tải xong MP3, size={file_size}")
-
+            
             if not BUCKET_NAME:
-                result = {"status": "error", "message": "Chưa cấu hình GCS_BUCKET"}
-            else:
-                # Upload lên GCS
-                dest_blob = f"audio/{os.path.basename(final_filename)}" # Gom vào thư mục audio/ cho gọn
-                gcs_url = upload_to_gcs(final_filename, BUCKET_NAME, dest_blob)
-                
-                result = {
-                    "status": "ok",
-                    "job_id": job_id,
-                    "title": info.get("title"),
-                    "type": "audio",
-                    "url": url,
-                    "download_url": gcs_url
-                }
+                return jsonify({"status": "error", "message": "Chưa cấu hình GCS_BUCKET"}), 500
+            
+            dest_blob = f"audio/{job_id}.mp3"
+            gcs_url = upload_to_gcs(final_filename, BUCKET_NAME, dest_blob)
+            
+            # 4. Trả về kết quả NGAY LẬP TỨC
+            return jsonify({
+                "status": "success",
+                "title": title,
+                "url": url,
+                "download_url": gcs_url,
+                "file_size": file_size
+            })
         else:
-            result = {"status": "error", "message": "Không tìm thấy file MP3 sau khi tải"}
+            return jsonify({"status": "error", "message": "Lỗi: Không tìm thấy file sau khi tải"}), 500
 
     except Exception as e:
-        app.logger.error(f"Job {job_id} Lỗi: {str(e)}")
-        result = {"status": "error", "message": str(e)}
+        app.logger.error(f"Lỗi: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
     finally:
-        # Dọn dẹp file tạm
-        if final_filename and os.path.exists(final_filename):
+        # Dọn dẹp file rác
+        if os.path.exists(final_filename):
             os.remove(final_filename)
-
-    # Gửi kết quả về n8n (hoặc nơi gọi)
-    try:
-        import requests
-        requests.post(callback_url, json=result, timeout=10)
-    except Exception as e:
-        app.logger.warning(f"Callback lỗi: {e}")
-
-@app.route("/download-audio", methods=["POST"])
-def download_audio():
-    data = request.get_json(silent=True)
-    if not data or "url" not in data or "callback_url" not in data:
-        return jsonify({"status": "error", "message": "Thiếu url hoặc callback_url"}), 400
-
-    job_id = str(uuid.uuid4())
-    url = data["url"]
-    callback_url = data["callback_url"]
-
-    # Chạy ngầm để không bị timeout request
-    thread = threading.Thread(target=process_audio_job, args=(job_id, url, callback_url))
-    thread.start()
-
-    return jsonify({"status": "queued", "job_id": job_id})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
