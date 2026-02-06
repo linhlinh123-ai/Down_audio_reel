@@ -1,5 +1,5 @@
 flask
-yt-dlp>=2024.09.15
+yt-dlp>=2026.02.04
 google-cloud-storage
 gunicorn
 requests
